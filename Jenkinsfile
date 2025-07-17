@@ -5,14 +5,25 @@ pipeline {
         NODE_ENV = 'development'
         IMAGE_NAME = 'my-node-app'
         PATH = "/usr/local/bin:${env.PATH}"
-        MINIKUBE_HOME = '/usr/local/bin/minikube'  // Minikube path
-    }
-
-    tools {
-        nodejs 'Nodejs'
+        MINIKUBE_HOME = "${env.HOME}/.minikube"  // Corrected Minikube home path
     }
 
     stages {
+        stage('Setup Minikube') {
+            steps {
+                script {
+                    // Create proper Minikube directory
+                    sh 'mkdir -p ${HOME}/.minikube'
+                    
+                    // Start Minikube with proper driver (docker is usually best for CI)
+                    sh 'minikube start --driver=docker --force'
+                    
+                    // Configure Docker to use Minikube's environment
+                    sh 'eval $(minikube docker-env)'
+                }
+            }
+        }
+
         stage('Checkout') {
             steps {
                 checkout scm
@@ -25,37 +36,12 @@ pipeline {
             }
         }
 
-        stage('Debug Environment') {
-            steps {
-                sh 'echo $PATH'
-                sh 'which docker'
-                sh 'docker --version'
-                sh 'minikube version'
-                sh 'kubectl version --client'
-            }
-        }
-
-        stage('Start Minikube') {
-            steps {
-                script {
-                    // Start Minikube if not running
-                    sh 'minikube status || minikube start --driver=docker'
-                    
-                    // Point Docker to Minikube's Docker daemon
-                    sh 'eval $(minikube docker-env)'
-                    
-                    // Verify we're using Minikube's Docker
-                    sh 'docker info | grep "Name: minikube"'
-                }
-            }
-        }
-
         stage('Build Docker Image') {
             steps {
                 script {
                     def imageTag = "${IMAGE_NAME}:${env.BUILD_NUMBER}"
                     sh "docker build -t ${imageTag} ."
-                    echo "Docker image ${imageTag} built successfully in Minikube environment."
+                    echo "Docker image ${imageTag} built successfully."
                 }
             }
         }
@@ -64,33 +50,43 @@ pipeline {
             steps {
                 script {
                     def imageTag = "${IMAGE_NAME}:${env.BUILD_NUMBER}"
-                    def appName = "${IMAGE_NAME}-${env.BUILD_NUMBER}"
                     
-                    // Apply Kubernetes deployment
+                    // Apply Kubernetes configuration
                     sh """
-                        kubectl create deployment ${appName} --image=${imageTag} --dry-run=client -o yaml > deployment.yaml
+                        kubectl create configmap merngraphql-config \
+                            --from-literal=PORT=4000 \
+                            --from-literal=NODE_ENV=production \
+                            --dry-run=client -o yaml > configmap.yaml
+                        
+                        kubectl create secret generic mongodb-secret \
+                            --from-literal=MONGO_URI='mongodb+srv://Ganesh:root%40123@cluster0.pnuzrrg.mongodb.net/merngraphql?retryWrites=true&w=majority' \
+                            --dry-run=client -o yaml > secret.yaml
+                        
+                        kubectl apply -f configmap.yaml
+                        kubectl apply -f secret.yaml
+                        
+                        # Create deployment
+                        kubectl create deployment merngraphql \
+                            --image=${imageTag} \
+                            --port=4000 \
+                            --dry-run=client -o yaml > deployment.yaml
+                        
+                        # Add environment variables to deployment
+                        sh '''sed -i '' -e '/containers:/a\\
+                              envFrom:\\
+                              - configMapRef:\\
+                                  name: merngraphql-config\\
+                              - secretRef:\\
+                                  name: mongodb-secret' deployment.yaml'''
+                        
                         kubectl apply -f deployment.yaml
+                        
+                        # Expose the service
+                        kubectl expose deployment merngraphql \
+                            --type=NodePort \
+                            --port=80 \
+                            --target-port=4000
                     """
-                    
-                    // Expose the deployment as a service
-                    sh "kubectl expose deployment ${appName} --type=NodePort --port=3000"
-                    
-                    // Get the service URL
-                    sh "minikube service ${appName} --url"
-                }
-            }
-        }
-
-        stage('Verify Deployment') {
-            steps {
-                script {
-                    // Wait for pods to be ready
-                    sh 'kubectl wait --for=condition=ready pod -l app=${IMAGE_NAME}-${env.BUILD_NUMBER} --timeout=120s'
-                    
-                    // Get deployment status
-                    sh 'kubectl get deployments'
-                    sh 'kubectl get pods'
-                    sh 'kubectl get services'
                 }
             }
         }
@@ -98,15 +94,9 @@ pipeline {
 
     post {
         always {
-            echo 'Pipeline finished.'
-            // Clean up Minikube Docker environment
+            echo 'Cleaning up...'
+            sh 'minikube delete'
             sh 'eval $(minikube docker-env -u)'
-        }
-        success {
-            echo 'Build and deployment succeeded!'
-        }
-        failure {
-            echo 'Build or deployment failed.'
         }
     }
 }
