@@ -5,20 +5,15 @@ pipeline {
         NODE_ENV = 'development'
         IMAGE_NAME = 'my-node-app'
         PATH = "/usr/local/bin:${env.PATH}"
-        MINIKUBE_HOME = "${env.HOME}/.minikube"  // Corrected Minikube home path
+        MINIKUBE_HOME = "${env.HOME}/.minikube"
     }
 
     stages {
         stage('Setup Minikube') {
             steps {
                 script {
-                    // Create proper Minikube directory
                     sh 'mkdir -p ${HOME}/.minikube'
-                    
-                    // Start Minikube with proper driver (docker is usually best for CI)
                     sh 'minikube start --driver=docker --force'
-                    
-                    // Configure Docker to use Minikube's environment
                     sh 'eval $(minikube docker-env)'
                 }
             }
@@ -51,41 +46,81 @@ pipeline {
                 script {
                     def imageTag = "${IMAGE_NAME}:${env.BUILD_NUMBER}"
                     
-                    // Apply Kubernetes configuration
+                    // Create complete deployment YAML file
                     sh """
-                        kubectl create configmap merngraphql-config \
-                            --from-literal=PORT=4000 \
-                            --from-literal=NODE_ENV=production \
-                            --dry-run=client -o yaml > configmap.yaml
+                        cat <<EOF > k8s-deployment.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: merngraphql-config
+data:
+  PORT: "4000"
+  NODE_ENV: "production"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-secret
+type: Opaque
+stringData:
+  MONGO_URI: "mongodb+srv://Ganesh:root%40123@cluster0.pnuzrrg.mongodb.net/merngraphql?retryWrites=true&w=majority"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: merngraphql
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: merngraphql
+  template:
+    metadata:
+      labels:
+        app: merngraphql
+    spec:
+      containers:
+      - name: merngraphql
+        image: ${imageTag}
+        ports:
+        - containerPort: 4000
+        envFrom:
+        - configMapRef:
+            name: merngraphql-config
+        - secretRef:
+            name: mongodb-secret
+        readinessProbe:
+          httpGet:
+            path: /graphql
+            port: 4000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /graphql
+            port: 4000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: merngraphql-service
+spec:
+  selector:
+    app: merngraphql
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 4000
+  type: NodePort
+EOF
+
+                        # Apply the complete configuration
+                        kubectl apply -f k8s-deployment.yaml
                         
-                        kubectl create secret generic mongodb-secret \
-                            --from-literal=MONGO_URI='mongodb+srv://Ganesh:root%40123@cluster0.pnuzrrg.mongodb.net/merngraphql?retryWrites=true&w=majority' \
-                            --dry-run=client -o yaml > secret.yaml
-                        
-                        kubectl apply -f configmap.yaml
-                        kubectl apply -f secret.yaml
-                        
-                        # Create deployment
-                        kubectl create deployment merngraphql \
-                            --image=${imageTag} \
-                            --port=4000 \
-                            --dry-run=client -o yaml > deployment.yaml
-                        
-                        # Add environment variables to deployment
-                        sh '''sed -i '' -e '/containers:/a\\
-                              envFrom:\\
-                              - configMapRef:\\
-                                  name: merngraphql-config\\
-                              - secretRef:\\
-                                  name: mongodb-secret' deployment.yaml'''
-                        
-                        kubectl apply -f deployment.yaml
-                        
-                        # Expose the service
-                        kubectl expose deployment merngraphql \
-                            --type=NodePort \
-                            --port=80 \
-                            --target-port=4000
+                        # Get the service URL
+                        sh 'minikube service merngraphql-service --url'
                     """
                 }
             }
