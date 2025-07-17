@@ -9,12 +9,46 @@ pipeline {
     }
 
     stages {
-        stage('Setup Minikube') {
+        stage('Setup Environment') {
             steps {
                 script {
-                    sh 'mkdir -p ${HOME}/.minikube'
-                    sh 'minikube start --driver=docker --force'
-                    sh 'eval $(minikube docker-env)'
+                    // Verify and install Minikube if needed (macOS version)
+                    sh '''
+                        #!/bin/bash -l
+                        if ! command -v minikube &> /dev/null; then
+                            echo "Installing Minikube..."
+                            brew install minikube || {
+                                curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-darwin-amd64
+                                sudo install minikube-darwin-amd64 /usr/local/bin/minikube
+                                rm minikube-darwin-amd64
+                            }
+                        fi
+                        
+                        if ! command -v kubectl &> /dev/null; then
+                            echo "Installing kubectl..."
+                            brew install kubectl || {
+                                curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/darwin/amd64/kubectl"
+                                chmod +x kubectl
+                                sudo mv kubectl /usr/local/bin/
+                            }
+                        fi
+                        
+                        mkdir -p ${HOME}/.minikube
+                        minikube version
+                        kubectl version --client
+                    '''
+                }
+            }
+        }
+
+        stage('Start Minikube') {
+            steps {
+                script {
+                    sh '''
+                        #!/bin/bash -l
+                        minikube start --driver=docker --force
+                        eval $(minikube docker-env)
+                    '''
                 }
             }
         }
@@ -46,8 +80,8 @@ pipeline {
                 script {
                     def imageTag = "${IMAGE_NAME}:${env.BUILD_NUMBER}"
                     
-                    // Create complete deployment YAML file
                     sh """
+                        #!/bin/bash -l
                         cat <<EOF > k8s-deployment.yaml
 apiVersion: v1
 kind: ConfigMap
@@ -116,11 +150,13 @@ spec:
   type: NodePort
 EOF
 
-                        # Apply the complete configuration
                         kubectl apply -f k8s-deployment.yaml
                         
-                        # Get the service URL
-                        sh 'minikube service merngraphql-service --url'
+                        # Wait for service to be ready
+                        sleep 10
+                        
+                        # Get minikube service URL (macOS specific)
+                        minikube service merngraphql-service --url || true
                     """
                 }
             }
@@ -130,8 +166,11 @@ EOF
     post {
         always {
             echo 'Cleaning up...'
-            sh 'minikube delete'
-            sh 'eval $(minikube docker-env -u)'
+            sh '''
+                #!/bin/bash -l
+                minikube delete || true
+                eval $(minikube docker-env -u) || true
+            '''
         }
     }
 }
